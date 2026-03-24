@@ -1,7 +1,6 @@
 require('dotenv').config();
 const express = require('express');
-const path = require('path');
-const { supabaseAdmin, createUserClient } = require('./lib/supabase');
+const { supabaseAdmin } = require('./lib/supabase');
 const bcrypt = require('bcrypt');
 const cors = require('cors');
 const crypto = require('crypto');
@@ -40,11 +39,13 @@ apiKey.apiKey = process.env.BREVO_API_KEY;
 const app = express();
 
 app.use(helmet());
+
+// FIX: Only call express.json() ONCE (was called twice in new server)
 app.use(express.json({ limit: '10kb' }));
 
 const limiter = rateLimit({
     windowMs: 15 * 60 * 1000,
-    max: 500,
+    max: 1000, // increased from 500 — college app with many concurrent users
     standardHeaders: true,
     legacyHeaders: false,
     handler: (req, res) => {
@@ -57,6 +58,7 @@ app.use(limiter);
 const PORT = process.env.PORT || 3000;
 const IS_PRODUCTION = process.env.NODE_ENV === 'production';
 
+// --- Redis Client (caching only) ---
 let redisClient = {
     isOpen: false,
     get: async () => null,
@@ -111,7 +113,6 @@ app.use(cors({
 }));
 
 app.options('*', cors());
-app.use(express.json());
 
 app.get('/', (req, res) => {
     res.send('🚀 Flobms backend server is running successfully');
@@ -137,6 +138,7 @@ async function testSupabaseConnection() {
 }
 testSupabaseConnection();
 
+// --- Auth Middleware: requires full student profile ---
 async function requireAuth(req, res, next) {
     const authHeader = req.headers['authorization'];
     const token = authHeader && authHeader.split(' ')[1];
@@ -157,7 +159,7 @@ async function requireAuth(req, res, next) {
             .maybeSingle();
         if (studentError || !student) {
             console.log('❌ No student record found for auth user:', user.id);
-            return res.status(401).json({ error: 'Account not fully set up. Please complete your profile.' });
+            return res.status(401).json({ error: 'Account not fully set up. Please complete your profile.', needsOnboarding: true });
         }
         req.session = {
             userUSN: student.usn,
@@ -168,11 +170,12 @@ async function requireAuth(req, res, next) {
         };
         next();
     } catch (err) {
-        console.error('❌ Auth error:', err.message, err.stack);
+        console.error('❌ Auth error:', err.message);
         return res.status(401).json({ error: 'Authentication error' });
     }
 }
 
+// --- Auth Middleware: only validates Supabase token, no student record needed (for Google onboarding) ---
 async function requireAuthToken(req, res, next) {
     const authHeader = req.headers['authorization'];
     const token = authHeader && authHeader.split(' ')[1];
@@ -249,7 +252,8 @@ app.post('/api/signup', async (req, res) => {
         console.log('✅ Student registered:', usn);
         res.status(201).json({
             success: true, message: 'Student registered successfully!',
-            token: signInData.session.access_token, refresh_token: signInData.session.refresh_token,
+            token: signInData.session.access_token,
+            refresh_token: signInData.session.refresh_token,
             userUSN: usn, userName: name
         });
     } catch (err) {
@@ -278,7 +282,8 @@ app.post('/api/signin', async (req, res) => {
         console.log('✅ User signed in:', student.usn);
         res.json({
             success: true, message: 'Signed in successfully',
-            token: data.session.access_token, refresh_token: data.session.refresh_token,
+            token: data.session.access_token,
+            refresh_token: data.session.refresh_token,
             userUSN: student.usn, userName: student.sname
         });
     } catch (err) {
@@ -287,13 +292,53 @@ app.post('/api/signin', async (req, res) => {
     }
 });
 
-app.post('/api/signout', requireAuth, async (req, res) => {
+// FIX: signout is graceful — works even if token is missing/expired
+app.post('/api/signout', async (req, res) => {
     try {
-        await supabaseAdmin.auth.admin.signOut(req.session.accessToken);
-        console.log('✅ User signed out:', req.session.userUSN);
+        const authHeader = req.headers['authorization'];
+        const token = authHeader && authHeader.split(' ')[1];
+        if (token) {
+            try {
+                await supabaseAdmin.auth.admin.signOut(token);
+            } catch (e) {
+                // non-fatal — token may already be expired
+            }
+        }
+        console.log('✅ User signed out');
         res.json({ success: true, message: 'Signed out successfully' });
     } catch (err) {
         res.json({ success: true, message: 'Signed out successfully' });
+    }
+});
+
+app.get('/api/me', requireAuth, async (req, res) => {
+    try {
+        const { data: rows, error } = await supabaseAdmin
+            .from('student')
+            .select('usn, sname, sem, mobno, emailid, organizer_pin, auth_id')
+            .eq('usn', req.session.userUSN)
+            .limit(1);
+        if (error || !rows?.length) {
+            return res.status(404).json({ error: 'User not found' });
+        }
+        const student = rows[0];
+        let hasGoogleIdentity = false;
+        let hasPasswordIdentity = false;
+        try {
+            const { data: { user } } = await supabaseAdmin.auth.admin.getUserById(student.auth_id);
+            hasGoogleIdentity = user?.identities?.some(i => i.provider === 'google') || false;
+            hasPasswordIdentity = user?.identities?.some(i => i.provider === 'email') || false;
+        } catch (e) {
+            // non-fatal
+        }
+        res.json({
+            userUSN: student.usn, userName: student.sname, semester: student.sem,
+            mobile: student.mobno, email: student.emailid,
+            hasPinSet: !!student.organizer_pin, hasGoogleIdentity, hasPasswordIdentity
+        });
+    } catch (err) {
+        console.error('Error fetching user info:', err);
+        res.status(500).json({ error: 'Error fetching user info' });
     }
 });
 
@@ -356,30 +401,133 @@ app.post('/api/change-password', requireAuth, async (req, res) => {
     }
 });
 
-app.get('/api/me', requireAuth, async (req, res) => {
+// ==================== PASSWORD RESET (using Supabase Auth) ====================
+
+app.post('/api/forgot-password', async (req, res) => {
     try {
-        const { data: rows, error } = await supabaseAdmin
-            .from('student')
-            .select('usn, sname, sem, mobno, emailid, organizer_pin, auth_id')
-            .eq('usn', req.session.userUSN)
-            .limit(1);
-        if (error || !rows?.length) {
-            return res.status(404).json({ error: 'User not found' });
+        const { email } = req.body;
+        if (!email) return res.status(400).json({ error: 'Email is required' });
+
+        // Always return success to prevent email enumeration
+        const { data: user } = await supabaseAdmin
+            .from('student').select('usn, sname').eq('emailid', email).maybeSingle();
+
+        if (user) {
+            // Use Supabase built-in password reset
+            const { error } = await supabaseAdmin.auth.resetPasswordForEmail(email, {
+                redirectTo: `${process.env.FRONTEND_URL}/reset-password`
+            });
+            if (error) {
+                console.error('Error sending reset email:', error);
+            } else {
+                console.log('✅ Password reset email sent to:', email);
+            }
         }
-        const student = rows[0];
-        const { data: { user } } = await supabaseAdmin.auth.admin.getUserById(student.auth_id);
-        const hasGoogleIdentity = user?.identities?.some(i => i.provider === 'google');
-        const hasPasswordIdentity = user?.identities?.some(i => i.provider === 'email');
-        res.json({
-            userUSN: student.usn, userName: student.sname, semester: student.sem,
-            mobile: student.mobno, email: student.emailid,
-            hasPinSet: !!student.organizer_pin, hasGoogleIdentity, hasPasswordIdentity
-        });
+
+        res.json({ success: true, message: 'If an account exists, you will receive a reset link.' });
     } catch (err) {
-        res.status(500).json({ error: 'Error fetching user info' });
+        console.error('Error in forgot password:', err);
+        res.status(500).json({ error: 'Failed to process request' });
     }
 });
 
+// FIX: Supabase Auth handles token verification — this endpoint accepts the new password
+// after the user clicks the reset link (frontend should exchange the token via Supabase client)
+app.post('/api/reset-password', async (req, res) => {
+    try {
+        const { token, newPassword } = req.body;
+        if (!token || !newPassword) {
+            return res.status(400).json({ error: 'Token and new password are required' });
+        }
+        if (newPassword.length < 6) {
+            return res.status(400).json({ error: 'Password must be at least 6 characters long' });
+        }
+        // Verify the recovery token using Supabase
+        const { data, error } = await supabaseAdmin.auth.verifyOtp({
+            token_hash: token,
+            type: 'recovery'
+        });
+        if (error || !data?.user) {
+            return res.status(400).json({ error: 'Invalid or expired reset link. Please request a new one.' });
+        }
+        const { error: updateError } = await supabaseAdmin.auth.admin.updateUserById(
+            data.user.id, { password: newPassword }
+        );
+        if (updateError) {
+            return res.status(500).json({ error: 'Failed to reset password' });
+        }
+        const { data: student } = await supabaseAdmin
+            .from('student').select('sname').eq('auth_id', data.user.id).maybeSingle();
+        console.log('✅ Password reset successful for auth user:', data.user.id);
+        res.json({
+            success: true,
+            message: 'Password reset successfully! You can now sign in with your new password.',
+            userName: student?.sname || ''
+        });
+    } catch (err) {
+        console.error('Error in reset password:', err);
+        res.status(500).json({ error: 'Failed to reset password' });
+    }
+});
+
+// ==================== GOOGLE AUTH ONBOARDING ====================
+
+// FIX: Added GET handler — frontend was calling GET /api/complete-google-signup
+// This returns the current onboarding status for a Google-authed user
+app.get('/api/complete-google-signup', requireAuthToken, async (req, res) => {
+    try {
+        const { data: student } = await supabaseAdmin
+            .from('student').select('usn, sname').eq('auth_id', req.session.authId).maybeSingle();
+        if (student) {
+            return res.json({ needsOnboarding: false, userUSN: student.usn, userName: student.sname });
+        }
+        const { data: { user } } = await supabaseAdmin.auth.admin.getUserById(req.session.authId);
+        res.json({
+            needsOnboarding: true,
+            email: user?.email || '',
+            name: user?.user_metadata?.full_name || user?.email?.split('@')[0] || ''
+        });
+    } catch (err) {
+        console.error('Error checking onboarding status:', err);
+        res.status(500).json({ error: 'Failed to check onboarding status' });
+    }
+});
+
+app.post('/api/complete-google-signup', requireAuthToken, async (req, res) => {
+    try {
+        const { usn, sem, mobno, organizerPin } = req.body;
+        if (!usn || !sem || !mobno) {
+            return res.status(400).json({ error: 'USN, semester and mobile are required' });
+        }
+        if (organizerPin && !/^\d{4,6}$/.test(organizerPin)) {
+            return res.status(400).json({ error: 'Organizer PIN must be 4 to 6 digits' });
+        }
+        const { data: existing } = await supabaseAdmin
+            .from('student').select('usn').eq('usn', usn).maybeSingle();
+        if (existing) return res.status(400).json({ error: 'This USN is already registered' });
+        const { data: { user } } = await supabaseAdmin.auth.admin.getUserById(req.session.authId);
+        const name = user.user_metadata?.full_name || user.email.split('@')[0];
+        const email = user.email;
+        const hashedPin = organizerPin ? await bcrypt.hash(organizerPin, 10) : null;
+        const { error: insertError } = await supabaseAdmin.from('student').insert([{
+            usn, sname: name, sem: parseInt(sem), mobno, emailid: email,
+            auth_id: req.session.authId, organizer_pin: hashedPin
+        }]);
+        if (insertError) {
+            console.error('Error creating student record:', insertError);
+            return res.status(500).json({ error: 'Failed to complete profile setup' });
+        }
+        console.log('✅ Google user onboarded:', usn);
+        res.json({ success: true, userName: name, userUSN: usn });
+    } catch (err) {
+        console.error('Error in Google onboarding:', err);
+        res.status(500).json({ error: 'Failed to complete setup' });
+    }
+});
+
+// ==================== EVENTS ====================
+
+// FIX: Fetch full event list with all fields including banner_url
 app.get('/api/events', requireAuth, async (req, res) => {
     try {
         const currentDate = new Date().toISOString().split('T')[0];
@@ -396,8 +544,9 @@ app.get('/api/events', requireAuth, async (req, res) => {
                 .from('event')
                 .select(`
                     eid, ename, eventdesc, eventdate, eventtime, eventloc, maxpart, maxvoln, regfee,
-                    upi_id, is_team, min_team_size, max_team_size, poster_url, banner_url, activity_points,
-                    max_activity_pts, vol_activity_pts, min_part_scans, min_voln_scans,
+                    upi_id, is_team, min_team_size, max_team_size, poster_url, banner_url,
+                    activity_points, max_activity_pts, vol_activity_pts, min_part_scans, min_voln_scans,
+                    certificate_info,
                     club:orgcid(cname), student:orgusn(sname)
                 `);
             if (error) throw error;
@@ -416,6 +565,7 @@ app.get('/api/events', requireAuth, async (req, res) => {
                 is_team: event.is_team, min_team_size: event.min_team_size, max_team_size: event.max_team_size,
                 activityPoints: event.activity_points || 0, maxActivityPts: event.max_activity_pts || 0,
                 volActivityPts: event.vol_activity_pts || 0,
+                certificateInfo: event.certificate_info,
                 clubName: event.club?.cname, organizerName: event.student?.sname
             };
             const eventDate = new Date(event.eventdate).toISOString().split('T')[0];
@@ -430,113 +580,48 @@ app.get('/api/events', requireAuth, async (req, res) => {
     }
 });
 
-app.get('/api/my-participant-events', requireAuth, async (req, res) => {
+// FIX: Single event fetch now includes ALL fields: banner_url, upi_id, is_team, certificate_info, etc.
+app.get('/api/events/:eventId', requireAuth, async (req, res) => {
     try {
-        const { data: participantEvents, error } = await supabaseAdmin
-            .from('participant')
-            .select(`
-                partstatus, partusn, parteid,
-                event:parteid (
-                    eid, ename, eventdesc, certificate_info, eventdate, eventtime, eventloc,
-                    maxpart, maxvoln, regfee, poster_url, activity_points, max_activity_pts,
-                    club:orgcid(cname)
-                )
-            `)
-            .eq('partusn', req.session.userUSN);
-        if (error) {
-            console.error('Error fetching participant events:', error);
-            return res.status(500).json({ error: 'Database error' });
-        }
-        const userUSN = req.session.userUSN;
-        const transformedEvents = [];
-        for (const p of (participantEvents || [])) {
-            const event = p.event;
-            if (!event?.eid) continue;
-            let earnedActivityPts = 0;
-            const maxActivityPts = event.max_activity_pts || 0;
-            if (maxActivityPts > 0 && p.partstatus) {
-                const { data: attendanceData } = await supabaseAdmin
-                    .from('sub_event_attendance')
-                    .select('seid')
-                    .eq('eid', event.eid).eq('usn', userUSN).eq('role', 'participant');
-                if (attendanceData && attendanceData.length > 0) {
-                    const seids = attendanceData.map(a => a.seid);
-                    const { data: subPts } = await supabaseAdmin
-                        .from('sub_event').select('seid, activity_pts').in('seid', seids);
-                    const sum = (subPts || []).reduce((s, se) => s + (se.activity_pts || 0), 0);
-                    earnedActivityPts = Math.min(sum, maxActivityPts);
-                }
-            }
-            transformedEvents.push({
-                ...event,
-                eventDate: event.eventdate, eventTime: event.eventtime, eventLoc: event.eventloc,
-                maxPart: event.maxpart, maxVoln: event.maxvoln, regFee: event.regfee,
-                posterUrl: event.poster_url, activityPoints: event.activity_points || 0,
-                maxActivityPts, earnedActivityPts, clubName: event.club?.cname,
-                PartStatus: p.partstatus == true, PartUSN: p.partusn, role: 'participant'
-            });
-        }
-        res.json({ participantEvents: transformedEvents, userUSN: req.session.userUSN });
-    } catch (err) {
-        console.error('Error fetching participant events:', err);
-        res.status(500).json({ error: 'Error fetching participant events' });
-    }
-});
-
-app.get('/api/my-volunteer-events', requireAuth, async (req, res) => {
-    try {
-        const { data: volunteerEvents, error } = await supabaseAdmin
-            .from('volunteer')
-            .select(`
-                volnstatus, volnusn, volneid,
-                event:volneid (
-                    eid, ename, eventdesc, eventdate, eventtime, eventloc, maxpart, maxvoln, regfee,
-                    vol_activity_pts, club:orgcid(cname)
-                )
-            `)
-            .eq('volnusn', req.session.userUSN);
-        if (error) {
-            console.error('Error fetching volunteer events:', error);
-            return res.status(500).json({ error: 'Database error' });
-        }
-        const transformedEvents = (volunteerEvents || []).map(v => {
-            const volActivityPts = v.event?.vol_activity_pts || 0;
-            return {
-                ...v.event,
-                eventDate: v.event?.eventdate, eventTime: v.event?.eventtime, eventLoc: v.event?.eventloc,
-                maxPart: v.event?.maxpart, maxVoln: v.event?.maxvoln, regFee: v.event?.regfee,
-                volActivityPts, earnedActivityPts: v.volnstatus ? volActivityPts : 0,
-                clubName: v.event?.club?.cname, VolnStatus: v.volnstatus == true, role: 'volunteer'
-            };
-        }).filter(e => e.eid);
-        res.json({ volunteerEvents: transformedEvents, userUSN: req.session.userUSN });
-    } catch (err) {
-        console.error('Error fetching volunteer events:', err);
-        res.status(500).json({ error: 'Error fetching volunteer events' });
-    }
-});
-
-app.get('/api/my-organized-events', requireAuth, async (req, res) => {
-    try {
-        const { data: organizerEvents, error } = await supabaseAdmin
+        const eventId = req.params.eventId;
+        if (!eventId || isNaN(eventId)) return res.status(400).json({ error: 'Invalid event ID' });
+        const { data: rows, error } = await supabaseAdmin
             .from('event')
-            .select(`eid, ename, eventdesc, eventdate, eventtime, eventloc, maxpart, maxvoln, regfee, upi_id, poster_url, activity_points, club:orgcid(cname)`)
-            .eq('orgusn', req.session.userUSN);
-        if (error) {
-            console.error('Error fetching organized events:', error);
-            return res.status(500).json({ error: 'Database error' });
-        }
-        const transformedEvents = (organizerEvents || []).map(e => ({
-            ...e,
-            eventDate: e.eventdate, eventTime: e.eventtime, eventLoc: e.eventloc,
-            maxPart: e.maxpart, maxVoln: e.maxvoln, regFee: e.regfee,
-            upiId: e.upi_id, posterUrl: e.poster_url,
-            activityPoints: e.activity_points || 0, clubName: e.club?.cname, role: 'organizer'
-        }));
-        res.json({ organizerEvents: transformedEvents, userUSN: req.session.userUSN });
+            .select(`
+                eid, ename, eventdesc, eventdate, eventtime, eventloc, maxpart, maxvoln, regfee,
+                orgusn, upi_id, is_team, min_team_size, max_team_size,
+                poster_url, banner_url, activity_points, certificate_info,
+                max_activity_pts, vol_activity_pts, min_part_scans, min_voln_scans,
+                club:orgcid(cname), student:orgusn(sname)
+            `)
+            .eq('eid', eventId).limit(1);
+        if (error) return res.status(500).json({ error: 'Database error' });
+        if (!rows || rows.length === 0) return res.status(404).json({ error: 'Event not found' });
+        const event = rows[0];
+        const transformedEvent = {
+            ...event,
+            eventDate: event.eventdate, eventTime: event.eventtime, eventLoc: event.eventloc,
+            maxPart: event.maxpart, maxVoln: event.maxvoln, regFee: event.regfee,
+            upiId: event.upi_id, posterUrl: event.poster_url, bannerUrl: event.banner_url,
+            activityPoints: event.activity_points || 0,
+            maxActivityPts: event.max_activity_pts || 0, volActivityPts: event.vol_activity_pts || 0,
+            minPartScans: event.min_part_scans || 1, minVolnScans: event.min_voln_scans || 1,
+            certificateInfo: event.certificate_info,
+            clubName: event.club?.cname, organizerName: event.student?.sname, OrgUsn: event.orgusn
+        };
+        const { data: participantCheck } = await supabaseAdmin
+            .from('participant').select('partstatus, payment_status')
+            .eq('partusn', req.session.userUSN).eq('parteid', eventId).limit(1);
+        const { data: volunteerCheck } = await supabaseAdmin
+            .from('volunteer').select('volnstatus')
+            .eq('volnusn', req.session.userUSN).eq('volneid', eventId).limit(1);
+        transformedEvent.isRegistered = participantCheck && participantCheck.length > 0;
+        transformedEvent.paymentStatus = participantCheck?.[0]?.payment_status || null;
+        transformedEvent.isVolunteer = volunteerCheck && volunteerCheck.length > 0;
+        transformedEvent.isOrganizer = event.orgusn === req.session.userUSN;
+        res.json(transformedEvent);
     } catch (err) {
-        console.error('Error fetching organized events:', err);
-        res.status(500).json({ error: 'Error fetching organized events' });
+        res.status(500).json({ error: 'Error fetching event details: ' + err.message });
     }
 });
 
@@ -571,7 +656,6 @@ app.post('/api/events/create', requireAuth, upload.single('banner'), async (req,
                 .from('memberof').select('clubid')
                 .eq('studentusn', req.session.userUSN).eq('clubid', organizedClubId).limit(1);
             if (memberError) {
-                console.error('Membership check failed:', memberError);
                 return res.status(500).json({ error: 'Database verification failed' });
             }
             if (!membershipCheck || membershipCheck.length === 0) {
@@ -617,6 +701,125 @@ app.post('/api/events/create', requireAuth, upload.single('banner'), async (req,
         res.status(500).json({ error: `Error creating event: ${err.message}` });
     }
 });
+
+// ==================== MY EVENTS ====================
+
+app.get('/api/my-participant-events', requireAuth, async (req, res) => {
+    try {
+        const { data: participantEvents, error } = await supabaseAdmin
+            .from('participant')
+            .select(`
+                partstatus, partusn, parteid,
+                event:parteid (
+                    eid, ename, eventdesc, certificate_info, eventdate, eventtime, eventloc,
+                    maxpart, maxvoln, regfee, poster_url, banner_url, activity_points, max_activity_pts,
+                    club:orgcid(cname)
+                )
+            `)
+            .eq('partusn', req.session.userUSN);
+        if (error) {
+            console.error('Error fetching participant events:', error);
+            return res.status(500).json({ error: 'Database error' });
+        }
+        const userUSN = req.session.userUSN;
+        const transformedEvents = [];
+        for (const p of (participantEvents || [])) {
+            const event = p.event;
+            if (!event?.eid) continue;
+            let earnedActivityPts = 0;
+            const maxActivityPts = event.max_activity_pts || 0;
+            if (maxActivityPts > 0 && p.partstatus) {
+                const { data: attendanceData } = await supabaseAdmin
+                    .from('sub_event_attendance')
+                    .select('seid')
+                    .eq('eid', event.eid).eq('usn', userUSN).eq('role', 'participant');
+                if (attendanceData && attendanceData.length > 0) {
+                    const seids = attendanceData.map(a => a.seid);
+                    const { data: subPts } = await supabaseAdmin
+                        .from('sub_event').select('seid, activity_pts').in('seid', seids);
+                    const sum = (subPts || []).reduce((s, se) => s + (se.activity_pts || 0), 0);
+                    earnedActivityPts = Math.min(sum, maxActivityPts);
+                }
+            }
+            transformedEvents.push({
+                ...event,
+                eventDate: event.eventdate, eventTime: event.eventtime, eventLoc: event.eventloc,
+                maxPart: event.maxpart, maxVoln: event.maxvoln, regFee: event.regfee,
+                posterUrl: event.poster_url, bannerUrl: event.banner_url,
+                activityPoints: event.activity_points || 0,
+                maxActivityPts, earnedActivityPts, clubName: event.club?.cname,
+                PartStatus: p.partstatus == true, PartUSN: p.partusn, role: 'participant'
+            });
+        }
+        res.json({ participantEvents: transformedEvents, userUSN: req.session.userUSN });
+    } catch (err) {
+        console.error('Error fetching participant events:', err);
+        res.status(500).json({ error: 'Error fetching participant events' });
+    }
+});
+
+app.get('/api/my-volunteer-events', requireAuth, async (req, res) => {
+    try {
+        const { data: volunteerEvents, error } = await supabaseAdmin
+            .from('volunteer')
+            .select(`
+                volnstatus, volnusn, volneid,
+                event:volneid (
+                    eid, ename, eventdesc, eventdate, eventtime, eventloc, maxpart, maxvoln, regfee,
+                    poster_url, banner_url, vol_activity_pts, club:orgcid(cname)
+                )
+            `)
+            .eq('volnusn', req.session.userUSN);
+        if (error) {
+            console.error('Error fetching volunteer events:', error);
+            return res.status(500).json({ error: 'Database error' });
+        }
+        const transformedEvents = (volunteerEvents || []).map(v => {
+            const volActivityPts = v.event?.vol_activity_pts || 0;
+            return {
+                ...v.event,
+                eventDate: v.event?.eventdate, eventTime: v.event?.eventtime, eventLoc: v.event?.eventloc,
+                maxPart: v.event?.maxpart, maxVoln: v.event?.maxvoln, regFee: v.event?.regfee,
+                posterUrl: v.event?.poster_url, bannerUrl: v.event?.banner_url,
+                volActivityPts, earnedActivityPts: v.volnstatus ? volActivityPts : 0,
+                clubName: v.event?.club?.cname, VolnStatus: v.volnstatus == true, role: 'volunteer'
+            };
+        }).filter(e => e.eid);
+        res.json({ volunteerEvents: transformedEvents, userUSN: req.session.userUSN });
+    } catch (err) {
+        console.error('Error fetching volunteer events:', err);
+        res.status(500).json({ error: 'Error fetching volunteer events' });
+    }
+});
+
+app.get('/api/my-organized-events', requireAuth, async (req, res) => {
+    try {
+        const { data: organizerEvents, error } = await supabaseAdmin
+            .from('event')
+            .select(`
+                eid, ename, eventdesc, eventdate, eventtime, eventloc, maxpart, maxvoln, regfee,
+                upi_id, poster_url, banner_url, activity_points, club:orgcid(cname)
+            `)
+            .eq('orgusn', req.session.userUSN);
+        if (error) {
+            console.error('Error fetching organized events:', error);
+            return res.status(500).json({ error: 'Database error' });
+        }
+        const transformedEvents = (organizerEvents || []).map(e => ({
+            ...e,
+            eventDate: e.eventdate, eventTime: e.eventtime, eventLoc: e.eventloc,
+            maxPart: e.maxpart, maxVoln: e.maxvoln, regFee: e.regfee,
+            upiId: e.upi_id, posterUrl: e.poster_url, bannerUrl: e.banner_url,
+            activityPoints: e.activity_points || 0, clubName: e.club?.cname, role: 'organizer'
+        }));
+        res.json({ organizerEvents: transformedEvents, userUSN: req.session.userUSN });
+    } catch (err) {
+        console.error('Error fetching organized events:', err);
+        res.status(500).json({ error: 'Error fetching organized events' });
+    }
+});
+
+// ==================== JOIN / VOLUNTEER ====================
 
 // Join as participant (free events)
 // RULES: organizer cannot join own event | volunteer cannot join as participant
@@ -703,6 +906,8 @@ app.post('/api/events/:eventId/volunteer', requireAuth, async (req, res) => {
     }
 });
 
+// ==================== EVENT INFO ENDPOINTS ====================
+
 app.get('/api/events/:eventId/volunteer-count', requireAuth, async (req, res) => {
     try {
         const { count, error } = await supabaseAdmin
@@ -752,6 +957,8 @@ app.get('/api/events/:eventId/participant-status', requireAuth, async (req, res)
     }
 });
 
+// ==================== SUB-EVENTS ====================
+
 app.get('/api/events/:eventId/sub-events', requireAuth, async (req, res) => {
     try {
         const eventId = req.params.eventId;
@@ -798,7 +1005,7 @@ app.put('/api/sub-events/:seid', requireAuth, async (req, res) => {
     try {
         const seid = req.params.seid;
         const { se_name, activity_pts, se_details, password } = req.body;
-        if (!password) return res.status(400).json({ error: 'Password is required to confirm changes' });
+        if (!password) return res.status(400).json({ error: 'Organizer PIN is required to confirm changes' });
         if (activity_pts !== undefined && activity_pts < 0) {
             return res.status(400).json({ error: 'Activity points cannot be negative' });
         }
@@ -836,7 +1043,7 @@ app.delete('/api/sub-events/:seid', requireAuth, async (req, res) => {
     try {
         const seid = req.params.seid;
         const { password } = req.body;
-        if (!password) return res.status(400).json({ error: 'Password is required to confirm deletion' });
+        if (!password) return res.status(400).json({ error: 'Organizer PIN is required to confirm deletion' });
         const { data: userData, error: userError } = await supabaseAdmin
             .from('student').select('organizer_pin').eq('usn', req.session.userUSN).single();
         if (userError || !userData) return res.status(401).json({ error: 'User verification failed' });
@@ -866,45 +1073,7 @@ app.delete('/api/sub-events/:seid', requireAuth, async (req, res) => {
     }
 });
 
-app.get('/api/events/:eventId', requireAuth, async (req, res) => {
-    try {
-        const eventId = req.params.eventId;
-        if (!eventId || isNaN(eventId)) return res.status(400).json({ error: 'Invalid event ID' });
-        const { data: rows, error } = await supabaseAdmin
-            .from('event')
-            .select(`
-                eid, ename, eventdesc, eventdate, eventtime, eventloc, maxpart, maxvoln, regfee, orgusn, poster_url, activity_points,
-                max_activity_pts, vol_activity_pts, min_part_scans, min_voln_scans,
-                club:orgcid(cname), student:orgusn(sname)
-            `)
-            .eq('eid', eventId).limit(1);
-        if (error) return res.status(500).json({ error: 'Database error' });
-        if (!rows || rows.length === 0) return res.status(404).json({ error: 'Event not found' });
-        const event = rows[0];
-        const transformedEvent = {
-            ...event,
-            eventDate: event.eventdate, eventTime: event.eventtime, eventLoc: event.eventloc,
-            maxPart: event.maxpart, maxVoln: event.maxvoln, regFee: event.regfee,
-            posterUrl: event.poster_url, activityPoints: event.activity_points || 0,
-            maxActivityPts: event.max_activity_pts || 0, volActivityPts: event.vol_activity_pts || 0,
-            minPartScans: event.min_part_scans || 1, minVolnScans: event.min_voln_scans || 1,
-            clubName: event.club?.cname, organizerName: event.student?.sname, OrgUsn: event.orgusn
-        };
-        const { data: participantCheck } = await supabaseAdmin
-            .from('participant').select('partstatus, payment_status')
-            .eq('partusn', req.session.userUSN).eq('parteid', eventId).limit(1);
-        const { data: volunteerCheck } = await supabaseAdmin
-            .from('volunteer').select('volnstatus')
-            .eq('volnusn', req.session.userUSN).eq('volneid', eventId).limit(1);
-        transformedEvent.isRegistered = participantCheck && participantCheck.length > 0;
-        transformedEvent.paymentStatus = participantCheck?.[0]?.payment_status || null;
-        transformedEvent.isVolunteer = volunteerCheck && volunteerCheck.length > 0;
-        transformedEvent.isOrganizer = event.orgusn === req.session.userUSN;
-        res.json(transformedEvent);
-    } catch (err) {
-        res.status(500).json({ error: 'Error fetching event details: ' + err.message });
-    }
-});
+// ==================== CLUBS & STUDENTS ====================
 
 app.get('/api/clubs', requireAuth, async (req, res) => {
     try {
@@ -927,9 +1096,11 @@ app.get('/api/my-clubs', requireAuth, async (req, res) => {
     }
 });
 
+// FIX: Restored mobno in students response (some frontend pages depend on it for display)
 app.get('/api/students', requireAuth, async (req, res) => {
     try {
-        const { data: rows, error } = await supabaseAdmin.from('student').select('usn, sname, sem, emailid');
+        const { data: rows, error } = await supabaseAdmin
+            .from('student').select('usn, sname, sem, mobno, emailid');
         if (error) return res.status(500).json({ error: 'Database error' });
         res.json({ students: rows || [], currentUser: req.session.userUSN });
     } catch (err) {
@@ -937,15 +1108,22 @@ app.get('/api/students', requireAuth, async (req, res) => {
     }
 });
 
+// ==================== ATTENDANCE (QR) ====================
+
 function validateQRToken(seid, token, timestamp) {
     const now = Date.now();
     const ts = parseInt(timestamp, 10);
     if (isNaN(ts) || now - ts > QR_TOKEN_VALIDITY_MS) return false;
     const payload = `${seid}:${timestamp}`;
     const expected = crypto.createHmac('sha256', QR_TOKEN_SECRET).update(payload).digest('hex').substring(0, 16);
-    return crypto.timingSafeEqual(Buffer.from(token, 'utf8'), Buffer.from(expected, 'utf8'));
+    try {
+        return crypto.timingSafeEqual(Buffer.from(token, 'utf8'), Buffer.from(expected, 'utf8'));
+    } catch (e) {
+        return false;
+    }
 }
 
+// FIX: Attendance marking — ensure supabaseAdmin is used so RLS doesn't block inserts
 app.post('/api/mark-participant-attendance', requireAuth, async (req, res) => {
     try {
         const { seid, usn, token, timestamp } = req.body;
@@ -960,19 +1138,22 @@ app.post('/api/mark-participant-attendance', requireAuth, async (req, res) => {
         if (subEventError || !subEvent?.length) return res.status(404).json({ error: 'Sub-event not found' });
         const eventId = subEvent[0].eid;
         const { data: existing } = await supabaseAdmin
-            .from('participant').select('*').eq('partusn', usn).eq('parteid', eventId).limit(1);
+            .from('participant').select('partstatus, payment_status').eq('partusn', usn).eq('parteid', eventId).limit(1);
         if (!existing?.length) return res.status(404).json({ error: 'You are not registered for this event' });
         if (existing[0].payment_status === 'pending_verification') {
-            return res.status(400).json({ error: 'Your payment is pending verification' });
+            return res.status(400).json({ error: 'Your payment is pending verification by the organizer' });
         }
         const { data: existingAttendance } = await supabaseAdmin
-            .from('sub_event_attendance').select('*').eq('seid', seid).eq('usn', usn).eq('role', 'participant').limit(1);
+            .from('sub_event_attendance').select('id').eq('seid', seid).eq('usn', usn).eq('role', 'participant').limit(1);
         if (existingAttendance?.length) {
             return res.status(400).json({ error: 'Attendance already marked for this sub-event' });
         }
         const { error: insertError } = await supabaseAdmin.from('sub_event_attendance')
             .insert([{ seid: parseInt(seid), eid: eventId, usn, role: 'participant' }]);
-        if (insertError) return res.status(500).json({ error: 'Failed to mark attendance' });
+        if (insertError) {
+            console.error('Attendance insert error:', insertError);
+            return res.status(500).json({ error: 'Failed to mark attendance: ' + insertError.message });
+        }
         const { count: scanCount } = await supabaseAdmin
             .from('sub_event_attendance').select('*', { count: 'exact', head: true })
             .eq('eid', eventId).eq('usn', usn).eq('role', 'participant');
@@ -981,12 +1162,19 @@ app.post('/api/mark-participant-attendance', requireAuth, async (req, res) => {
         const minPartScans = eventData?.[0]?.min_part_scans || 1;
         const thresholdMet = (scanCount || 0) >= minPartScans;
         if (thresholdMet) {
-            await supabaseAdmin.from('participant').update({ partstatus: true })
-                .eq('partusn', usn).eq('parteid', eventId);
+            const { error: updateError } = await supabaseAdmin.from('participant')
+                .update({ partstatus: true }).eq('partusn', usn).eq('parteid', eventId);
+            if (updateError) {
+                console.error('Status update error:', updateError);
+            }
         }
         console.log(`✅ Participant attendance: ${usn} for sub-event ${seid} (event ${eventId})`);
-        res.json({ success: true, message: 'Attendance marked', attendanceCount: scanCount || 0, minRequired: minPartScans, thresholdMet });
+        res.json({
+            success: true, message: 'Attendance marked successfully',
+            attendanceCount: scanCount || 0, minRequired: minPartScans, thresholdMet
+        });
     } catch (err) {
+        console.error('Error marking participant attendance:', err);
         res.status(500).json({ error: 'Error marking attendance: ' + err.message });
     }
 });
@@ -1005,16 +1193,19 @@ app.post('/api/mark-volunteer-attendance', requireAuth, async (req, res) => {
         if (!subEvent?.length) return res.status(404).json({ error: 'Sub-event not found' });
         const eventId = subEvent[0].eid;
         const { data: existing } = await supabaseAdmin
-            .from('volunteer').select('*').eq('volnusn', usn).eq('volneid', eventId).limit(1);
+            .from('volunteer').select('volnstatus').eq('volnusn', usn).eq('volneid', eventId).limit(1);
         if (!existing?.length) return res.status(404).json({ error: 'You are not registered as a volunteer for this event' });
         const { data: existingAttendance } = await supabaseAdmin
-            .from('sub_event_attendance').select('*').eq('seid', seid).eq('usn', usn).eq('role', 'volunteer').limit(1);
+            .from('sub_event_attendance').select('id').eq('seid', seid).eq('usn', usn).eq('role', 'volunteer').limit(1);
         if (existingAttendance?.length) {
             return res.status(400).json({ error: 'Attendance already marked for this sub-event' });
         }
         const { error: insertError } = await supabaseAdmin.from('sub_event_attendance')
             .insert([{ seid: parseInt(seid), eid: eventId, usn, role: 'volunteer' }]);
-        if (insertError) return res.status(500).json({ error: 'Failed to mark attendance' });
+        if (insertError) {
+            console.error('Volunteer attendance insert error:', insertError);
+            return res.status(500).json({ error: 'Failed to mark attendance: ' + insertError.message });
+        }
         const { count: scanCount } = await supabaseAdmin
             .from('sub_event_attendance').select('*', { count: 'exact', head: true })
             .eq('eid', eventId).eq('usn', usn).eq('role', 'volunteer');
@@ -1027,13 +1218,61 @@ app.post('/api/mark-volunteer-attendance', requireAuth, async (req, res) => {
                 .eq('volnusn', usn).eq('volneid', eventId);
         }
         console.log(`✅ Volunteer attendance: ${usn} for sub-event ${seid} (event ${eventId})`);
-        res.json({ success: true, message: 'Attendance marked', attendanceCount: scanCount || 0, minRequired: minVolnScans, thresholdMet });
+        res.json({
+            success: true, message: 'Attendance marked successfully',
+            attendanceCount: scanCount || 0, minRequired: minVolnScans, thresholdMet
+        });
     } catch (err) {
+        console.error('Error marking volunteer attendance:', err);
         res.status(500).json({ error: 'Error marking attendance: ' + err.message });
     }
 });
 
-// ==================== ORGANIZER PIN ENDPOINTS ====================
+// FIX: Kept legacy scan-qr endpoint for backward compat with old QR codes
+app.get('/api/scan-qr', async (req, res) => {
+    try {
+        const { usn, eid } = req.query;
+        if (!usn || !eid) return res.status(400).json({ error: 'USN and Event ID are required' });
+        const { data: existing } = await supabaseAdmin
+            .from('participant').select('*').eq('partusn', usn).eq('parteid', eid).limit(1);
+        if (!existing || existing.length === 0) {
+            return res.status(404).json({ error: 'Participant not found for this event' });
+        }
+        if (existing[0].partstatus === true) {
+            return res.status(400).json({ error: 'Participant already checked in' });
+        }
+        await supabaseAdmin.from('participant').update({ partstatus: true }).eq('partusn', usn).eq('parteid', eid);
+        res.json({ success: true, message: 'Participant checked in successfully' });
+    } catch (err) {
+        res.status(500).json({ error: 'Error updating participant status: ' + err.message });
+    }
+});
+
+// ==================== QR TOKEN GENERATION ====================
+
+app.get('/api/sub-events/:seid/qr-token', requireAuth, async (req, res) => {
+    try {
+        const seid = req.params.seid;
+        const userUSN = req.session.userUSN;
+        const { data: subEvent, error } = await supabaseAdmin
+            .from('sub_event').select('eid, se_name').eq('seid', seid).limit(1);
+        if (error || !subEvent?.length) return res.status(404).json({ error: 'Sub-event not found' });
+        const eventId = subEvent[0].eid;
+        const { data: event, error: eventError } = await supabaseAdmin
+            .from('event').select('orgusn').eq('eid', eventId).limit(1);
+        if (eventError || !event?.length) return res.status(404).json({ error: 'Event not found' });
+        if (event[0].orgusn !== userUSN) return res.status(403).json({ error: 'Only the organizer can generate QR tokens' });
+        const timestamp = Date.now().toString();
+        const payload = `${seid}:${timestamp}`;
+        const token = crypto.createHmac('sha256', QR_TOKEN_SECRET).update(payload).digest('hex').substring(0, 16);
+        res.json({ token, timestamp, seid, eid: eventId, seName: subEvent[0].se_name });
+    } catch (err) {
+        console.error('QR token generation error:', err);
+        res.status(500).json({ error: 'Failed to generate token' });
+    }
+});
+
+// ==================== ORGANIZER PIN ====================
 
 app.post('/api/set-organizer-pin', requireAuth, async (req, res) => {
     try {
@@ -1044,7 +1283,7 @@ app.post('/api/set-organizer-pin', requireAuth, async (req, res) => {
             return res.status(400).json({ error: 'PINs do not match' });
         const { data: userData } = await supabaseAdmin
             .from('student').select('organizer_pin').eq('usn', req.session.userUSN).single();
-        if (userData.organizer_pin)
+        if (userData?.organizer_pin)
             return res.status(400).json({ error: 'PIN already set. Use the change PIN flow.' });
         const hashedPin = await bcrypt.hash(newPin, 10);
         await supabaseAdmin.from('student').update({ organizer_pin: hashedPin }).eq('usn', req.session.userUSN);
@@ -1069,7 +1308,7 @@ app.post('/api/request-pin-otp', requireAuth, async (req, res) => {
         }).eq('usn', req.session.userUSN);
         const sendSmtpEmail = new Brevo.SendSmtpEmail();
         sendSmtpEmail.subject = 'Your Organizer PIN Change OTP - FLO';
-        sendSmtpEmail.sender = { name: 'FLO E-Pass System', email: 'flobms3@gmail.com' };
+        sendSmtpEmail.sender = { name: 'FLO', email: 'epass@flobms.com' };
         sendSmtpEmail.to = [{ email: userData.emailid, name: userData.sname }];
         sendSmtpEmail.htmlContent = `
             <html><body style="font-family: Arial, sans-serif; color: #333; background: #f5f5f5; padding: 20px;">
@@ -1125,19 +1364,16 @@ app.post('/api/reset-organizer-pin', requireAuth, async (req, res) => {
         if (newPin.length < 4) return res.status(400).json({ error: 'PIN must be at least 4 digits' });
         if (newPin.length > 6) return res.status(400).json({ error: 'PIN must be at most 6 digits' });
         if (newPin !== confirmPin) return res.status(400).json({ error: 'PINs do not match' });
-        const weakPins = ['123456', '654321', '111111', '000000', '1234', '0000', '1111', '9999', '123123', '112233', '123', '000', '111', '999'];
-        if (weakPins.includes(newPin))
-            return res.status(400).json({ error: 'This PIN is too common. Please choose a stronger PIN.' });
-        if (/^(\d)\1+$/.test(newPin))
-            return res.status(400).json({ error: 'PIN cannot be all the same digit' });
+        const weakPins = ['123456', '654321', '111111', '000000', '1234', '0000', '1111', '9999', '123123', '112233'];
+        if (weakPins.includes(newPin)) return res.status(400).json({ error: 'This PIN is too common. Please choose a stronger PIN.' });
+        if (/^(\d)\1+$/.test(newPin)) return res.status(400).json({ error: 'PIN cannot be all the same digit' });
         const digits = newPin.split('').map(Number);
         let asc = true, desc = true;
         for (let i = 1; i < digits.length; i++) {
             if (digits[i] !== digits[i - 1] + 1) asc = false;
             if (digits[i] !== digits[i - 1] - 1) desc = false;
         }
-        if (asc || desc)
-            return res.status(400).json({ error: 'PIN cannot be sequential digits (e.g. 1234 or 9876)' });
+        if (asc || desc) return res.status(400).json({ error: 'PIN cannot be sequential digits (e.g. 1234 or 9876)' });
         const hashedPin = await bcrypt.hash(newPin, 10);
         await supabaseAdmin.from('student').update({ organizer_pin: hashedPin }).eq('usn', req.session.userUSN);
         console.log(`✅ Organizer PIN changed for: ${req.session.userUSN}`);
@@ -1148,41 +1384,9 @@ app.post('/api/reset-organizer-pin', requireAuth, async (req, res) => {
     }
 });
 
-app.post('/api/complete-google-signup', requireAuthToken, async (req, res) => {
-    try {
-        const { usn, sem, mobno, organizerPin } = req.body;
-        if (!usn || !sem || !mobno) {
-            return res.status(400).json({ error: 'USN, semester and mobile are required' });
-        }
-        if (organizerPin && !/^\d{4,6}$/.test(organizerPin)) {
-            return res.status(400).json({ error: 'Organizer PIN must be 4 to 6 digits' });
-        }
-        const { data: existing } = await supabaseAdmin.from('student').select('usn').eq('usn', usn).maybeSingle();
-        if (existing) return res.status(400).json({ error: 'This USN is already registered' });
-        const { data: { user } } = await supabaseAdmin.auth.admin.getUserById(req.session.authId);
-        const name = user.user_metadata?.full_name || user.email.split('@')[0];
-        const email = user.email;
-        const hashedPin = organizerPin ? await bcrypt.hash(organizerPin, 10) : null;
-        const { error: insertError } = await supabaseAdmin.from('student').insert([{
-            usn, sname: name, sem: parseInt(sem), mobno, emailid: email,
-            auth_id: req.session.authId, organizer_pin: hashedPin
-        }]);
-        if (insertError) {
-            console.error('Error creating student record:', insertError);
-            return res.status(500).json({ error: 'Failed to complete profile setup' });
-        }
-        console.log('✅ Google user onboarded:', usn);
-        res.json({ success: true, userName: name });
-    } catch (err) {
-        console.error('Error in Google onboarding:', err);
-        res.status(500).json({ error: 'Failed to complete setup' });
-    }
-});
-
-// ==================== UPI PAYMENT ENDPOINTS ====================
+// ==================== UPI PAYMENT ====================
 
 // Register via UPI (paid individual)
-// RULES: organizer cannot join own event | volunteer cannot join as participant
 app.post('/api/events/:eventId/register-upi', requireAuth, async (req, res) => {
     try {
         const eventId = req.params.eventId;
@@ -1256,7 +1460,7 @@ app.post('/api/payments/verify', requireAuth, async (req, res) => {
                     .eq('event_id', eventId).eq('usn', participantUSN).eq('status', 'pending_verification');
                 await supabaseAdmin.from('participant').update({ payment_status: 'verified' })
                     .in('partusn', allTeamUSNs).eq('parteid', eventId);
-                // Mark team complete AFTER payment verified
+                // Mark team registration complete AFTER payment is verified
                 await supabaseAdmin.from('team').update({ registration_complete: true }).eq('id', teamId);
                 console.log(`✅ Payment verified for team ${teamId} (${allTeamUSNs.length} members)`);
                 return res.json({
@@ -1335,8 +1539,6 @@ app.get('/api/events/:eventId/pending-payments', requireAuth, async (req, res) =
 // ==================== TEAM ENDPOINTS ====================
 
 // Create team
-// RULES: organizer cannot create team in own event | volunteer cannot create team for event they volunteer at
-// organizer/volunteers cannot be added as members
 app.post('/api/events/:eventId/create-team', requireAuth, async (req, res) => {
     try {
         const eventId = req.params.eventId;
@@ -1411,7 +1613,10 @@ app.post('/api/events/:eventId/create-team', requireAuth, async (req, res) => {
             return res.status(500).json({ error: 'Failed to add team members' });
         }
         console.log(`✅ Team created: ${teamName} (ID: ${teamId}) by ${userUSN}`);
-        res.json({ success: true, message: 'Team created successfully! Invitations sent to members.', teamId, minSize, currentSize: 1, canRegister: minSize <= 1 });
+        res.json({
+            success: true, message: 'Team created successfully! Invitations sent to members.',
+            teamId, minSize, currentSize: 1, canRegister: minSize <= 1
+        });
     } catch (err) {
         console.error('Error creating team:', err);
         res.status(500).json({ error: 'Error creating team' });
@@ -1434,7 +1639,7 @@ app.post('/api/events/:eventId/join-team', requireAuth, async (req, res) => {
             }
         }
         const { data: team, error: teamError } = await supabaseAdmin
-            .from('team').select('id, team_name, registration_complete, max_team_size:event_id(max_team_size)')
+            .from('team').select('id, team_name, registration_complete')
             .eq('leader_usn', leaderUSN).eq('event_id', eventId).limit(1);
         if (teamError || !team || team.length === 0) return res.status(404).json({ error: 'Team not found. Please check the team leader USN.' });
         const teamId = team[0].id;
@@ -1502,9 +1707,7 @@ app.get('/api/events/:eventId/team-status', requireAuth, async (req, res) => {
     }
 });
 
-// Register team (free)
-// FIX: Added maxpart capacity check (maxpart = max number of teams)
-// FIX: Changed insert to upsert for participant records
+// Register team (free events)
 app.post('/api/events/:eventId/register-team', requireAuth, async (req, res) => {
     try {
         const eventId = req.params.eventId;
@@ -1551,8 +1754,6 @@ app.post('/api/events/:eventId/register-team', requireAuth, async (req, res) => 
 });
 
 // Register team via UPI (paid)
-// FIX: Removed registration_complete = true (moved to payments/verify)
-// FIX: Changed insert to upsert
 app.post('/api/events/:eventId/register-team-upi', requireAuth, async (req, res) => {
     try {
         const eventId = req.params.eventId;
@@ -1582,7 +1783,7 @@ app.post('/api/events/:eventId/register-team-upi', requireAuth, async (req, res)
         await supabaseAdmin.from('payment').insert([{
             usn: userUSN, event_id: eventId, amount: regFee, status: 'pending_verification', upi_transaction_id: transaction_id
         }]);
-        // NOTE: registration_complete is NOT set here — it is set in /api/payments/verify after organizer confirms payment
+        // NOTE: registration_complete is NOT set here — set in /api/payments/verify after organizer confirms
         const participantsToInsert = members.map(m => ({
             partusn: m.student_usn, parteid: eventId, partstatus: false, payment_status: 'pending_verification', team_id: teamId
         }));
@@ -1597,7 +1798,6 @@ app.post('/api/events/:eventId/register-team-upi', requireAuth, async (req, res)
 });
 
 // Add members to team
-// RULES: cannot add organizer | cannot add volunteers
 app.post('/api/teams/:teamId/add-members', requireAuth, async (req, res) => {
     try {
         const teamId = req.params.teamId;
@@ -1663,8 +1863,7 @@ app.get('/api/events/:eventId/my-invites', requireAuth, async (req, res) => {
     }
 });
 
-// Confirm join
-// RULE: volunteer cannot join team for event they are volunteering at
+// Confirm join team
 app.post('/api/teams/:teamId/confirm-join', requireAuth, async (req, res) => {
     try {
         const teamId = req.params.teamId;
@@ -1720,18 +1919,15 @@ app.get('/api/events/:eventId/generate-details', requireAuth, async (req, res) =
 
         const { data: participants, error: participantError } = await supabaseAdmin
             .from('participant').select('partusn, partstatus, payment_status, team_id').eq('parteid', eventId);
-        if (participantError) {
-            console.error('Error fetching participants:', participantError);
-            return res.status(500).json({ error: 'Database error (participants)' });
-        }
+        if (participantError) return res.status(500).json({ error: 'Database error (participants)' });
 
         const partUsns = participants && participants.length > 0 ? [...new Set(participants.map(p => p.partusn))] : [];
-        const { data: students } = partUsns.length > 0 ? await supabaseAdmin
-            .from('student').select('usn, sname, sem, mobno, emailid').in('usn', partUsns) : { data: [] };
+        const { data: students } = partUsns.length > 0
+            ? await supabaseAdmin.from('student').select('usn, sname, sem, mobno, emailid').in('usn', partUsns)
+            : { data: [] };
         const studentMap = (students || []).reduce((acc, s) => ({ ...acc, [s.usn]: s }), {});
 
-        const { data: teams } = await supabaseAdmin
-            .from('team').select('id, team_name').eq('event_id', eventId);
+        const { data: teams } = await supabaseAdmin.from('team').select('id, team_name').eq('event_id', eventId);
         const teamMap = (teams || []).reduce((acc, t) => ({ ...acc, [t.id]: t.team_name }), {});
 
         const { data: payments } = await supabaseAdmin
@@ -1740,14 +1936,12 @@ app.get('/api/events/:eventId/generate-details', requireAuth, async (req, res) =
 
         const { data: volunteers, error: volunteerError } = await supabaseAdmin
             .from('volunteer').select('volnusn, volnstatus').eq('volneid', eventId);
-        if (volunteerError) {
-            console.error('Error fetching volunteers:', volunteerError);
-            return res.status(500).json({ error: 'Database error (volunteers)' });
-        }
+        if (volunteerError) return res.status(500).json({ error: 'Database error (volunteers)' });
 
         const volUsns = volunteers && volunteers.length > 0 ? [...new Set(volunteers.map(v => v.volnusn))] : [];
-        const { data: volStudents } = volUsns.length > 0 ? await supabaseAdmin
-            .from('student').select('usn, sname').in('usn', volUsns) : { data: [] };
+        const { data: volStudents } = volUsns.length > 0
+            ? await supabaseAdmin.from('student').select('usn, sname').in('usn', volUsns)
+            : { data: [] };
         const volStudentMap = (volStudents || []).reduce((acc, s) => ({ ...acc, [s.usn]: s }), {});
 
         const workbook = new ExcelJS.Workbook();
@@ -1790,7 +1984,6 @@ app.get('/api/events/:eventId/generate-details', requireAuth, async (req, res) =
 
         const maxActivityPts = eventData.max_activity_pts || 0;
 
-        // Fetch attendance in two steps (no inner join needed)
         const { data: attendanceRaw } = await supabaseAdmin
             .from('sub_event_attendance').select('usn, seid').eq('eid', eventId).eq('role', 'participant');
         const { data: subEventPts } = await supabaseAdmin
@@ -1846,37 +2039,13 @@ app.get('/api/events/:eventId/generate-details', requireAuth, async (req, res) =
         });
 
         res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-        res.setHeader('Content-Disposition', `attachment; filename=Event_${eventData.ename.replace(/\s+/g, '_')}_Details.xlsx`);
+        res.setHeader('Content-Disposition', `attachment; filename=Event_${(eventData.ename || 'Event').replace(/\s+/g, '_')}_Details.xlsx`);
         await workbook.xlsx.write(res);
         res.end();
         console.log(`✅ Excel generated for event ${eventId} by ${userUSN}`);
     } catch (err) {
         console.error('Excel generation error:', err);
         res.status(500).json({ error: 'Error generating Excel file' });
-    }
-});
-
-// ==================== DYNAMIC QR TOKEN ====================
-
-app.get('/api/sub-events/:seid/qr-token', requireAuth, async (req, res) => {
-    try {
-        const seid = req.params.seid;
-        const userUSN = req.session.userUSN;
-        const { data: subEvent, error } = await supabaseAdmin
-            .from('sub_event').select('eid, se_name').eq('seid', seid).limit(1);
-        if (error || !subEvent?.length) return res.status(404).json({ error: 'Sub-event not found' });
-        const eventId = subEvent[0].eid;
-        const { data: event, error: eventError } = await supabaseAdmin
-            .from('event').select('orgusn').eq('eid', eventId).limit(1);
-        if (eventError || !event?.length) return res.status(404).json({ error: 'Event not found' });
-        if (event[0].orgusn !== userUSN) return res.status(403).json({ error: 'Only the organizer can generate QR tokens' });
-        const timestamp = Date.now().toString();
-        const payload = `${seid}:${timestamp}`;
-        const token = crypto.createHmac('sha256', QR_TOKEN_SECRET).update(payload).digest('hex').substring(0, 16);
-        res.json({ token, timestamp, seid, eid: eventId, seName: subEvent[0].se_name });
-    } catch (err) {
-        console.error('QR token generation error:', err);
-        res.status(500).json({ error: 'Failed to generate token' });
     }
 });
 
